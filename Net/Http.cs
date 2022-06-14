@@ -6,12 +6,17 @@ using System.Net;
 using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Threading.Tasks;
 using Debug = UnityEngine.Debug;
 
 namespace Net
 {
     public class Http
     {
+        public delegate void HttpGetAsyncProgressDelegate(string url, long totalSize, long size);
+
+        public delegate void HttpGetAsyncCompletedDelegate(string url, byte[] bytes);
+
         /// </summary>
         private const string DefaultUserAgent =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36 Edg/98.0.1108.62";
@@ -27,8 +32,14 @@ namespace Net
         /// </summary>
         private static readonly Encoding DefaultEncoding = Encoding.UTF8;
 
-        public static string Get(string url, Dictionary<string, string> args = null, Encoding encoding = null,
-            string contentType = DefaultContentType)
+        private static readonly Queue<byte[]> BufferPool = new Queue<byte[]>();
+        private static readonly Queue<MemoryStream> MemoryStreamPool = new Queue<MemoryStream>();
+
+        public static string Get(
+            string url,
+            Dictionary<string, string> args = null,
+            Encoding encoding = null,
+            string contentType = DefaultContentType, string userAgent = DefaultUserAgent)
         {
             var argsStr = args == null ? string.Empty : FormatKeyValuePairs(args);
             url = argsStr == string.Empty ? url : url + "?" + argsStr;
@@ -38,25 +49,53 @@ namespace Net
             HttpWebResponse response = null;
             try
             {
-                //ServicePointManager.Expect100Continue = false; //绕过代理服务器
-                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls | SecurityProtocolType.Tls11 |
-                                                       SecurityProtocolType.Tls12 | SecurityProtocolType.Ssl3;
-                ServicePointManager.ServerCertificateValidationCallback =
-                    new RemoteCertificateValidationCallback(CheckValidationResult);
-                request = (HttpWebRequest) WebRequest.Create(url);
-                request.Method = "GET";
-                request.ContentType = string.IsNullOrEmpty(DefaultContentType) ? DefaultContentType : contentType;
-                request.UserAgent = DefaultUserAgent;
-                request.Accept = "*/*";
-                request.ProtocolVersion = HttpVersion.Version11;
+                ServiceSetting();
+                contentType = string.IsNullOrEmpty(contentType) ? DefaultContentType : contentType;
+                userAgent = string.IsNullOrEmpty(userAgent) ? DefaultUserAgent : userAgent;
+                request = CreateHttpWebRequest(url, "GET", contentType, userAgent);
                 response = (HttpWebResponse) request.GetResponse();
                 using (var streamReader = new StreamReader(response.GetResponseStream(), encoding))
                     result = streamReader.ReadToEnd();
-                Debug.Log($"Http [GET] url:{url}");
+                // Debug.Log($"Http [GET] url:{url}");
             }
             catch (Exception e)
             {
-                Debug.LogError($"Http [GET] Error url:{url},\nerrorInfo:{e}");
+                // Debug.LogError($"Http [GET] Error url:{url},\nerrorInfo:{e}");
+            }
+            finally
+            {
+                if (request != null)
+                    request.Abort();
+                if (response != null)
+                    response.Close();
+            }
+
+            return result;
+        }
+
+        public static async Task<string> GetAsync(string url, Dictionary<string, string> args = null,
+            Encoding encoding = null, string contentType = DefaultContentType, string userAgent = DefaultUserAgent)
+        {
+            var argsStr = args == null ? string.Empty : FormatKeyValuePairs(args);
+            url = argsStr == string.Empty ? url : url + "?" + argsStr;
+            encoding = encoding ?? DefaultEncoding;
+            var result = string.Empty;
+            HttpWebRequest request = null;
+            HttpWebResponse response = null;
+            try
+            {
+                ServiceSetting();
+                contentType = string.IsNullOrEmpty(contentType) ? DefaultContentType : contentType;
+                userAgent = string.IsNullOrEmpty(userAgent) ? DefaultUserAgent : userAgent;
+                request = CreateHttpWebRequest(url, "GET", contentType, userAgent);
+                response = (HttpWebResponse) await request.GetResponseAsync();
+                using (var streamReader = new StreamReader(response.GetResponseStream(), encoding))
+                    result = await streamReader.ReadToEndAsync();
+                // Debug.Log($"Http [GET] url:{url}");
+            }
+            catch (Exception e)
+            {
+                // Debug.LogError($"Http [GET] Error url:{url},\nerrorInfo:{e}");
             }
             finally
             {
@@ -70,7 +109,7 @@ namespace Net
         }
 
         public static string Post(string url, Dictionary<string, string> args = null,
-            Encoding encoding = null, string contentType = DefaultContentType)
+            Encoding encoding = null, string contentType = DefaultContentType, string userAgent = DefaultUserAgent)
         {
             var result = string.Empty;
             HttpWebRequest request = null;
@@ -78,17 +117,10 @@ namespace Net
             encoding = encoding ?? DefaultEncoding;
             try
             {
-                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls | SecurityProtocolType.Tls11 |
-                                                       SecurityProtocolType.Tls12 | SecurityProtocolType.Ssl3;
-                ServicePointManager.ServerCertificateValidationCallback =
-                    new RemoteCertificateValidationCallback(CheckValidationResult);
-
-                request = (HttpWebRequest) WebRequest.Create(url);
-                request.Method = "POST";
-                request.ContentType = string.IsNullOrEmpty(DefaultContentType) ? DefaultContentType : contentType;
-                request.UserAgent = DefaultUserAgent;
-                request.Accept = "*/*";
-                request.ProtocolVersion = HttpVersion.Version11;
+                ServiceSetting();
+                contentType = string.IsNullOrEmpty(contentType) ? DefaultContentType : contentType;
+                userAgent = string.IsNullOrEmpty(userAgent) ? DefaultUserAgent : userAgent;
+                request = CreateHttpWebRequest(url, "POST", contentType, userAgent);
                 //默认httpWebRequest使用的是代理请求，获取结果相对较慢。这里直接设置为null，表示不使用代理。速度会提升！
                 request.Proxy = null;
 
@@ -107,7 +139,7 @@ namespace Net
             }
             catch (Exception e)
             {
-                Debug.LogError($"Http [POST] Error url:{url},\nerrorInfo:{e}");
+                // Debug.LogError($"Http [POST] Error url:{url},\nerrorInfo:{e}");
             }
             finally
             {
@@ -121,69 +153,160 @@ namespace Net
             return result;
         }
 
-        public static IEnumerator Download(string url, string dst, Action<long, float> onProgress,
-            int bufferSize = 4096)
+        public static async Task<string> PostAsync(string url, Dictionary<string, string> args = null,
+            Encoding encoding = null, string contentType = DefaultContentType, string userAgent = DefaultUserAgent)
         {
-            var error = string.Empty;
-            long contentLength = 0, downloadedBytes = 0;
+            var result = string.Empty;
             HttpWebRequest request = null;
             HttpWebResponse response = null;
-            Stream inputStream = null, outputStream = null;
+            encoding = encoding ?? DefaultEncoding;
             try
             {
-                request = (HttpWebRequest) WebRequest.Create(url);
-                response = (HttpWebResponse) request.GetResponse();
-                inputStream = response.GetResponseStream();
-                outputStream = new FileStream(dst, FileMode.Create);
-                contentLength = response.ContentLength;
+                ServiceSetting();
+                contentType = string.IsNullOrEmpty(contentType) ? DefaultContentType : contentType;
+                userAgent = string.IsNullOrEmpty(userAgent) ? DefaultUserAgent : userAgent;
+                request = CreateHttpWebRequest(url, "POST", contentType, userAgent);
+                //默认httpWebRequest使用的是代理请求，获取结果相对较慢。这里直接设置为null，表示不使用代理。速度会提升！
+                request.Proxy = null;
+                if (args != null)
+                {
+                    var argsStr = FormatKeyValuePairs(args);
+                    var bytes = encoding.GetBytes(argsStr);
+                    request.ContentLength = bytes.Length;
+                    using (var streamWriter = await request.GetRequestStreamAsync())
+                        await streamWriter.WriteAsync(bytes, 0, bytes.Length);
+                }
+
+                response = (HttpWebResponse) await request.GetResponseAsync();
+                using (var streamReader = new StreamReader(response.GetResponseStream(), encoding))
+                    result = await streamReader.ReadToEndAsync();
             }
             catch (Exception e)
             {
-                error = e.ToString();
+                // Debug.LogError($"Http [POST] Error url:{url},\nerrorInfo:{e}");
             }
-
-            if (!string.IsNullOrEmpty(error))
+            finally
             {
-                Debug.LogError(error);
-            }
-            else if (inputStream != null && outputStream != null)
-            {
-                int size;
-                var buffer = new byte[Math.Max(bufferSize, 1024)];
-                while ((size = inputStream.Read(buffer, 0, buffer.Length)) > 0)
-                {
-                    downloadedBytes += size;
-                    outputStream.Write(buffer, 0, size);
-                    var progress = downloadedBytes / (float) contentLength * 100; //当前位置
-                    //反馈回调 返回下载进度
-                    if (onProgress != null)
-                        onProgress(contentLength, progress);
-// #if UNITY_EDITOR
-                    // Debug.Log($"Download {url},progress:{progress}");
-// #endif
-                    yield return null;
-                }
+                if (request != null)
+                    request.Abort();
+
+                if (response != null)
+                    response.Close();
             }
 
-            inputStream?.Dispose();
-            outputStream?.Dispose();
-
-            request?.Abort();
-            response?.Dispose();
+            return result;
         }
 
-        public static bool CheckValidationResult(object sender, X509Certificate certificate, X509Chain chain,
+        public static async Task<byte[]> Download(string url, HttpGetAsyncProgressDelegate progressCallback = null,
+            string contentType = DefaultContentType, string userAgent = DefaultUserAgent)
+        {
+            byte[] result = null;
+            HttpWebRequest request = null;
+            HttpWebResponse response = null;
+            var buffer = BufferPool.Count > 0 ? BufferPool.Dequeue() : new byte[10240];
+            var memoryStream = MemoryStreamPool.Count > 0 ? MemoryStreamPool.Dequeue() : new MemoryStream();
+            try
+            {
+                contentType = string.IsNullOrEmpty(contentType) ? DefaultContentType : contentType;
+                userAgent = string.IsNullOrEmpty(userAgent) ? DefaultUserAgent : userAgent;
+                request = CreateHttpWebRequest(url, "GET", contentType, userAgent);
+                response = (HttpWebResponse) await request.GetResponseAsync();
+                var contentLength = response.ContentLength;
+                var stream = response.GetResponseStream();
+                int size = 0, downloadedBytes = 0;
+                memoryStream.SetLength(0);
+                while (stream != null && (size =
+                    await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                {
+                    downloadedBytes += size;
+                    await memoryStream.WriteAsync(buffer, 0, size);
+
+                    if (progressCallback != null)
+                        progressCallback(url, contentLength, downloadedBytes);
+                }
+
+                result = memoryStream.ToArray();
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"Download Error url:{url},\nerrorInfo:{e}");
+            }
+            finally
+            {
+                if (request != null)
+                    request.Abort();
+                if (response != null)
+                    response.Close();
+                BufferPool.Enqueue(buffer);
+                MemoryStreamPool.Enqueue(memoryStream);
+            }
+
+            return result;
+        }
+
+        public static IEnumerator Download(string url, HttpGetAsyncProgressDelegate progressCallback = null,
+            HttpGetAsyncCompletedDelegate completedCallback = null, string contentType = DefaultContentType,
+            string userAgent = DefaultUserAgent)
+        {
+            var task = Download(url, progressCallback, contentType, userAgent);
+
+            while (!task.IsCompleted)
+            {
+                if (task.IsCanceled || task.IsFaulted)
+                    yield break;
+
+                yield return null;
+            }
+
+            var result = task.Result;
+
+            if (completedCallback != null)
+                completedCallback(url, result);
+        }
+
+        public static void ClearPool()
+        {
+            BufferPool.Clear();
+            while (MemoryStreamPool.Count > 0)
+            {
+                var memoryStream = MemoryStreamPool.Dequeue();
+                memoryStream.Dispose();
+            }
+        }
+
+        private static void ServiceSetting()
+        {
+            //ServicePointManager.Expect100Continue = false; //绕过代理服务器
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls | SecurityProtocolType.Tls11 |
+                                                   SecurityProtocolType.Tls12 | SecurityProtocolType.Ssl3;
+            ServicePointManager.ServerCertificateValidationCallback = CheckValidationResult;
+        }
+
+        private static bool CheckValidationResult(object sender, X509Certificate certificate, X509Chain chain,
             SslPolicyErrors errors) => true;
 
-        public static string FormatKeyValuePairs(Dictionary<string, string> @params)
+        private static string FormatKeyValuePairs(Dictionary<string, string> @params)
         {
             var stringBuilder = new StringBuilder();
             var index = 0;
+
             const string format = "{0}={1}";
             foreach (var key in @params.Keys)
                 stringBuilder.AppendFormat(index++ > 0 ? "&" + format : format, key, @params[key]);
-
             return stringBuilder.ToString();
+        }
+
+        private static HttpWebRequest CreateHttpWebRequest(string url, string method, string contentType,
+            string userAgent)
+        {
+            var request = (HttpWebRequest) WebRequest.Create(url);
+            request.Method = method;
+            request.ContentType = string.IsNullOrEmpty(contentType) ? DefaultContentType : contentType;
+            request.UserAgent = string.IsNullOrEmpty(userAgent) ? DefaultUserAgent : userAgent;
+            request.Accept = "*/*";
+            request.ProtocolVersion = HttpVersion.Version11;
+
+            return request;
         }
     }
 }
