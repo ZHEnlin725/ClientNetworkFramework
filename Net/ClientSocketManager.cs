@@ -10,6 +10,7 @@ namespace Net
         public const int InvalidMessage = -1;
 
         public int messageId;
+        public int messageLength;
         public byte[] content;
     }
 
@@ -84,6 +85,7 @@ namespace Net
                 var content = message.content;
                 message.content = Bytes.Empty;
                 message.messageId = Message.InvalidMessage;
+                message.messageLength = 0;
                 Bytes.Dealloc(content);
             }
         }

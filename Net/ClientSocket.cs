@@ -34,13 +34,37 @@ namespace Net
 
     public class ClientSocket
     {
-        private const int SIZE_MSG_HEAD = 4;
-
         public enum Status : byte
         {
             Disconnected,
             Connecting,
             Connected,
+        }
+
+        private struct MessageHead
+        {
+            public short messageId;
+            public int messageLength;
+
+            public const int Size = sizeof(short) + sizeof(int);
+
+            public MessageHead(short messageId, int messageLength)
+            {
+                this.messageId = messageId;
+                this.messageLength = messageLength;
+            }
+
+            public void Serialize(DataWriter writer)
+            {
+                writer.Write(messageId);
+                writer.Write(messageLength);
+            }
+
+            public void Deserialize(DataReader reader)
+            {
+                messageId = reader.ReadInt16();
+                messageLength = reader.ReadInt32();
+            }
         }
 
         private sealed class DataReader
@@ -107,6 +131,13 @@ namespace Net
                 pointer += length;
                 return bytes;
             }
+
+            public MessageHead ReadMessageHead()
+            {
+                var messageHead = new MessageHead();
+                messageHead.Deserialize(this);
+                return messageHead;
+            }
         }
 
         private sealed class DataWriter
@@ -148,6 +179,12 @@ namespace Net
                 EnsureCapacity(pointer + length);
                 Buffer.BlockCopy(bytes, 0, buffer, pointer, length);
                 pointer += length;
+                return this;
+            }
+
+            public DataWriter Write(MessageHead messageHead)
+            {
+                messageHead.Serialize(this);
                 return this;
             }
 
@@ -201,10 +238,9 @@ namespace Net
 
         public void SendMessage(short messageId, byte[] content)
         {
-            var size = content?.Length ?? 0;
             _writer.pointer = 0;
-            var send = socket.Send(_writer.Write(size).Write(messageId).Write(content).buffer, 0, _writer.pointer,
-                SocketFlags.None);
+            var send = socket.Send(_writer.Write(messageId).Write(content?.Length ?? 0).Write(content).buffer, 0,
+                _writer.pointer, SocketFlags.None);
 
 #if ENABLE_DEBUG
                 Debug.Log(
@@ -307,7 +343,7 @@ namespace Net
         }
 
         private void BeginRecvMessage() =>
-            socket.BeginReceive(_reader.buffer, _reader.pointer = 0, _reader.readSize = SIZE_MSG_HEAD,
+            socket.BeginReceive(_reader.buffer, _reader.readSize = 0, MessageHead.Size,
                 SocketFlags.None, _cachedRecvMessageHeadAsyncCallback, null);
 
         private void RecvMessageHeadAsyncCallback(IAsyncResult ar)
@@ -319,21 +355,22 @@ namespace Net
                 return;
             }
 
-            _reader.pointer += receive;
-            var size = _reader.readSize;
+            _reader.readSize += receive;
             var bytes = _reader.buffer;
-            if (_reader.pointer == size)
+            if (_reader.readSize == MessageHead.Size)
             {
                 _reader.pointer = 0;
-                var contentSize = _reader.ReadInt32();
+                var messageHead = _reader.ReadMessageHead();
                 var message = _messageFunc != null ? _messageFunc() : new Message();
-                message.messageId = _reader.ReadInt16();
-                socket.BeginReceive(bytes, _reader.pointer = 0, _reader.readSize = contentSize, SocketFlags.None,
-                    _cachedRecvMessageContentAsyncCallback, message);
+                message.messageId = messageHead.messageId;
+                var messageLength = messageHead.messageLength;
+                message.messageLength = messageLength;
+                socket.BeginReceive(bytes, _reader.readSize = 0, messageLength,
+                    SocketFlags.None, _cachedRecvMessageContentAsyncCallback, message);
             }
             else
             {
-                socket.BeginReceive(bytes, _reader.pointer, size - _reader.pointer, SocketFlags.None,
+                socket.BeginReceive(bytes, _reader.readSize, MessageHead.Size - _reader.readSize, SocketFlags.None,
                     _cachedRecvMessageHeadAsyncCallback, null);
             }
         }
@@ -347,14 +384,14 @@ namespace Net
                 return;
             }
 
-            _reader.pointer += receive;
-            var size = _reader.readSize;
+            _reader.readSize += receive;
+            var message = (Message) ar.AsyncState;
+            var messageLength = message.messageLength;
             var bytes = _reader.buffer;
-            if (_reader.pointer == size)
+            if (_reader.readSize == messageLength)
             {
-                var message = (Message) ar.AsyncState;
                 _reader.pointer = 0;
-                message.content = size > 0 ? _reader.ReadBytes(size) : Bytes.Empty;
+                message.content = messageLength > 0 ? _reader.ReadBytes(messageLength) : Bytes.Empty;
                 //todo broadcast recv message
                 if (OnRecvMessage != null)
                     OnRecvMessage(message);
@@ -362,8 +399,8 @@ namespace Net
             }
             else
             {
-                socket.BeginReceive(bytes, _reader.pointer, size - _reader.pointer,
-                    SocketFlags.None, _cachedRecvMessageContentAsyncCallback, null);
+                socket.BeginReceive(bytes, _reader.readSize, messageLength - _reader.readSize,
+                    SocketFlags.None, _cachedRecvMessageContentAsyncCallback, message);
             }
         }
 
