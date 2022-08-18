@@ -245,7 +245,7 @@ namespace Net
 #if ENABLE_DEBUG
                 Debug.Log($"[Connect] Ip:{ip},port:{port}");
 #endif
-            CoroutineManager.sharedInstance.StartCoroutine(Connect(timeout, onSuccess, onFailure));
+            ClientSocketManager.sharedInstance.StartCoroutine(Connect(timeout, onSuccess, onFailure));
         }
 
         private IEnumerator Connect(int timeout, Action onSuccess, Action onFailure)

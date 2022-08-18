@@ -16,16 +16,29 @@ namespace Net
 
     public delegate void ClientSocketConnectResultHandle(int socketId, string ip, int port);
 
-    public class ClientSocketManager
+    public class ClientSocketManager : MonoBehaviour
     {
         #region Singleton
 
         private static ClientSocketManager _manager;
 
-        public static ClientSocketManager sharedInstance => _manager ?? (_manager = new ClientSocketManager());
-
-        private ClientSocketManager()
+        public static ClientSocketManager sharedInstance
         {
+            get
+            {
+                if (_manager == null)
+                {
+                    _manager = FindObjectOfType<ClientSocketManager>();
+                    if (_manager == null)
+                    {
+                        var go = new GameObject("Client Socket Manager");
+                        _manager = go.AddComponent<ClientSocketManager>();
+                        DontDestroyOnLoad(go);
+                    }
+                }
+
+                return _manager;
+            }
         }
 
         #endregion
@@ -73,7 +86,7 @@ namespace Net
             Debug.LogError($"Failed to send message with socketId:{socketId} !!!");
         }
 
-        public void Update()
+        void Update()
         {
             var count = 0;
             while (_messageQueue.Count > 0 && count++ < MessageHandleCount)
