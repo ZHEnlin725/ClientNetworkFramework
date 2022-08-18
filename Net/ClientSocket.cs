@@ -34,6 +34,9 @@ namespace Net
 
     public class ClientSocket
     {
+        private const int MSG_ID_SIZE = sizeof(short);
+        private const int MSG_HEAD_SIZE = sizeof(int);
+
         public enum Status : byte
         {
             Disconnected,
@@ -41,36 +44,10 @@ namespace Net
             Connected,
         }
 
-        private struct MessageHead
-        {
-            public short messageId;
-            public int messageLength;
-
-            public const int Size = sizeof(short) + sizeof(int);
-
-            public MessageHead(short messageId, int messageLength)
-            {
-                this.messageId = messageId;
-                this.messageLength = messageLength;
-            }
-
-            public void Serialize(DataWriter writer)
-            {
-                writer.Write(messageId);
-                writer.Write(messageLength);
-            }
-
-            public void Deserialize(DataReader reader)
-            {
-                messageId = reader.ReadInt16();
-                messageLength = reader.ReadInt32();
-            }
-        }
-
         private sealed class DataReader
         {
             public int pointer;
-            public int readSize;
+            public int recvSize;
             public bool isLittleEndian;
             public readonly byte[] buffer = new byte[65536];
 
@@ -85,33 +62,27 @@ namespace Net
                 return buffer[pointer++];
             }
 
-            public Int16 ReadInt16()
+            public Int16 ReadInt16() => (short) ReadFlexibleSize(2);
+
+            public Int32 ReadInt32() => (int) ReadFlexibleSize(4);
+
+            public Int64 ReadFlexibleSize(int size)
             {
-                if (pointer >= buffer.Length || pointer + 2 > buffer.Length)
+                long result = 0;
+
+                if (size > sizeof(long) || size <= 0)
+                    return result;
+
+                if (pointer >= buffer.Length || pointer + size > buffer.Length)
                 {
-                    Debug.LogError($"Out Of Index Read Int16 curPoint:{pointer},buffLen:{buffer.Length}!!!");
+                    Debug.LogError($"Out Of Index Read Length:{size} curPoint:{pointer},buffLen:{buffer.Length}!!!");
                     return 0;
                 }
 
-                short result = 0;
-                for (var i = 0; i < 2; i++)
-                    result |= (short) (buffer[isLittleEndian ? i + pointer : 2 - (i + 1) + pointer] << 8 * i);
-                pointer += 2;
-                return result;
-            }
+                for (var i = 0; i < size; i++)
+                    result |= buffer[isLittleEndian ? i + pointer : size - (i + 1) + pointer] << 8 * i;
+                pointer += size;
 
-            public Int32 ReadInt32()
-            {
-                if (pointer >= buffer.Length || pointer + 4 > buffer.Length)
-                {
-                    Debug.LogError($"Out Of Index Read Int32 curPoint:{pointer},buffLen:{buffer.Length}!!!");
-                    return 0;
-                }
-
-                var result = 0;
-                for (var i = 0; i < 4; i++)
-                    result |= buffer[isLittleEndian ? i + pointer : 4 - (i + 1) + pointer] << 8 * i;
-                pointer += 4;
                 return result;
             }
 
@@ -130,13 +101,6 @@ namespace Net
                 Buffer.BlockCopy(buffer, pointer, bytes, 0, length);
                 pointer += length;
                 return bytes;
-            }
-
-            public MessageHead ReadMessageHead()
-            {
-                var messageHead = new MessageHead();
-                messageHead.Deserialize(this);
-                return messageHead;
             }
         }
 
@@ -179,12 +143,6 @@ namespace Net
                 EnsureCapacity(pointer + length);
                 Buffer.BlockCopy(bytes, 0, buffer, pointer, length);
                 pointer += length;
-                return this;
-            }
-
-            public DataWriter Write(MessageHead messageHead)
-            {
-                messageHead.Serialize(this);
                 return this;
             }
 
@@ -239,7 +197,8 @@ namespace Net
         public void SendMessage(short messageId, byte[] content)
         {
             _writer.pointer = 0;
-            var send = socket.Send(_writer.Write(messageId).Write(content?.Length ?? 0).Write(content).buffer, 0,
+            var send = socket.Send(
+                _writer.Write((content?.Length ?? 0) + MSG_ID_SIZE).Write(messageId).Write(content).buffer, 0,
                 _writer.pointer, SocketFlags.None);
 
 #if ENABLE_DEBUG
@@ -343,7 +302,7 @@ namespace Net
         }
 
         private void BeginRecvMessage() =>
-            socket.BeginReceive(_reader.buffer, _reader.readSize = 0, MessageHead.Size,
+            socket.BeginReceive(_reader.buffer, _reader.recvSize = 0, MSG_HEAD_SIZE,
                 SocketFlags.None, _cachedRecvMessageHeadAsyncCallback, null);
 
         private void RecvMessageHeadAsyncCallback(IAsyncResult ar)
@@ -355,22 +314,19 @@ namespace Net
                 return;
             }
 
-            _reader.readSize += receive;
+            _reader.recvSize += receive;
             var bytes = _reader.buffer;
-            if (_reader.readSize == MessageHead.Size)
+            if (_reader.recvSize == MSG_HEAD_SIZE)
             {
                 _reader.pointer = 0;
-                var messageHead = _reader.ReadMessageHead();
                 var message = _messageFunc != null ? _messageFunc() : new Message();
-                message.messageId = messageHead.messageId;
-                var messageLength = messageHead.messageLength;
-                message.messageLength = messageLength;
-                socket.BeginReceive(bytes, _reader.readSize = 0, messageLength,
+                message.messageLength = (int) _reader.ReadFlexibleSize(MSG_HEAD_SIZE);
+                socket.BeginReceive(bytes, _reader.recvSize = 0, message.messageLength,
                     SocketFlags.None, _cachedRecvMessageContentAsyncCallback, message);
             }
             else
             {
-                socket.BeginReceive(bytes, _reader.readSize, MessageHead.Size - _reader.readSize, SocketFlags.None,
+                socket.BeginReceive(bytes, _reader.recvSize, MSG_HEAD_SIZE - _reader.recvSize, SocketFlags.None,
                     _cachedRecvMessageHeadAsyncCallback, null);
             }
         }
@@ -384,14 +340,17 @@ namespace Net
                 return;
             }
 
-            _reader.readSize += receive;
+            _reader.recvSize += receive;
             var message = (Message) ar.AsyncState;
             var messageLength = message.messageLength;
             var bytes = _reader.buffer;
-            if (_reader.readSize == messageLength)
+            if (_reader.recvSize == messageLength)
             {
                 _reader.pointer = 0;
-                message.content = messageLength > 0 ? _reader.ReadBytes(messageLength) : Bytes.Empty;
+                message.messageId = (int) _reader.ReadFlexibleSize(MSG_ID_SIZE);
+                var length = messageLength - MSG_ID_SIZE;
+                message.content = length > 0 ? _reader.ReadBytes(length) : Bytes.Empty;
+
                 //todo broadcast recv message
                 if (OnRecvMessage != null)
                     OnRecvMessage(message);
@@ -399,7 +358,7 @@ namespace Net
             }
             else
             {
-                socket.BeginReceive(bytes, _reader.readSize, messageLength - _reader.readSize,
+                socket.BeginReceive(bytes, _reader.recvSize, messageLength - _reader.recvSize,
                     SocketFlags.None, _cachedRecvMessageContentAsyncCallback, message);
             }
         }
