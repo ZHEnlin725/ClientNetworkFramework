@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace Net
@@ -43,7 +44,7 @@ namespace Net
 
         #endregion
 
-        public event MessageHandle MessageHandle;
+        public event MessageHandle messageHandle;
 
         private const int MessageHandleCount = 20;
 
@@ -52,10 +53,8 @@ namespace Net
 
         private readonly Dictionary<int, ClientSocket> _clientSocketDict = new Dictionary<int, ClientSocket>();
 
-        public event ClientSocketConnectResultHandle OnConnectSuccess, OnConnectFailure;
-
-        public void Connect(int socketId, string ip, int port, int timeoutMilliseconds = 5000,
-            bool isLittleEndian = false)
+        public void Connect(int socketId, string ip, int port, Action onSuccess, Action onFailure,
+            int timeoutMilliseconds = 5000, bool isLittleEndian = false)
         {
             if (!_clientSocketDict.TryGetValue(socketId, out var clientSocket))
             {
@@ -64,9 +63,7 @@ namespace Net
             }
 
             if (clientSocket.status == ClientSocket.Status.Disconnected)
-                clientSocket.Connect(ip, port, timeoutMilliseconds,
-                    () => OnConnectSuccess?.Invoke(socketId, ip, port),
-                    () => OnConnectFailure?.Invoke(socketId, ip, port), 5);
+                clientSocket.Connect(ip, port, timeoutMilliseconds, onSuccess, onFailure, 5);
         }
 
         public void Close(int socketId)
@@ -92,8 +89,8 @@ namespace Net
             while (_messageQueue.Count > 0 && count++ < MessageHandleCount)
             {
                 var message = _messageQueue.Dequeue();
-                if (MessageHandle != null)
-                    MessageHandle(message.messageId, message.content);
+                if (messageHandle != null)
+                    messageHandle(message.messageId, message.content);
                 _messagePool.Enqueue(message);
                 var content = message.content;
                 message.content = Bytes.Empty;
